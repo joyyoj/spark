@@ -17,9 +17,13 @@
 
 package org.apache.spark.streaming.flume
 
-import java.net.InetSocketAddress
+import java.net.{InetAddress, ServerSocket, InetSocketAddress}
 import java.io.{ObjectInput, ObjectOutput, Externalizable}
 import java.nio.ByteBuffer
+
+import com.google.common.base.Strings
+import org.apache.spark.flume.sink.utils.LogicalHostRouter
+import org.apache.spark.flume.sink.utils.LogicalHostRouter.PhysicalHost
 
 import scala.collection.JavaConversions._
 import scala.reflect.ClassTag
@@ -34,7 +38,7 @@ import org.apache.spark.util.Utils
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.streaming.StreamingContext
 import org.apache.spark.streaming.dstream._
-import org.apache.spark.Logging
+import org.apache.spark.{SparkConf, Logging}
 import org.apache.spark.streaming.receiver.Receiver
 
 private[streaming]
@@ -46,7 +50,13 @@ class FlumeInputDStream[T: ClassTag](
 ) extends ReceiverInputDStream[SparkFlumeEvent](ssc_) {
 
   override def getReceiver(): Receiver[SparkFlumeEvent] = {
-    new FlumeReceiver(host, port, storageLevel)
+    val conf = ssc_.conf
+    if (!Strings.isNullOrEmpty(host)) {
+      new FlumeReceiver(host, port, storageLevel)
+    } else {
+      logInfo("use dynamic flume receiver")
+      new DynamicFlumeReceiver(conf, storageLevel)
+    }
   }
 }
 
@@ -115,7 +125,7 @@ private[streaming] object SparkFlumeEvent {
 
 /** A simple server that implements Flume's Avro protocol. */
 private[streaming]
-class FlumeEventServer(receiver : FlumeReceiver) extends AvroSourceProtocol {
+class FlumeEventServer(receiver : Receiver[SparkFlumeEvent]) extends AvroSourceProtocol {
   override def append(event : AvroFlumeEvent) : Status = {
     receiver.store(SparkFlumeEvent.fromAvroFlumeEvent(event))
     Status.OK
@@ -153,3 +163,59 @@ class FlumeReceiver(
 
   override def preferredLocation = Some(host)
 }
+
+/** A NetworkReceiver which listens for events using the
+  * Flume Avro interface. */
+private[streaming]
+class DynamicFlumeReceiver(
+                     conf : SparkConf,
+                     storageLevel: StorageLevel
+                     ) extends Receiver[SparkFlumeEvent](storageLevel) with Logging {
+  val logicalHost = conf.get(DynamicFlumeReceiver.ROUTER_LOGICAL_HOST)
+  val routerPath = conf.get(DynamicFlumeReceiver.ROUTER_ROOT_PATH)
+  val retryIntervalInMs = conf.getInt(DynamicFlumeReceiver.ROUTER_RETRY_INTERVAL_IN_MS, 1000)
+  val retryTimes = conf.getInt(DynamicFlumeReceiver.ROUTER_RETRY_TIMES, 3)
+
+  lazy val routerConf = LogicalHostRouter.Conf.fromRouterPath(routerPath).
+    setRetryTimes(retryTimes).setRetryInterval(retryIntervalInMs)
+  lazy val hostRouter = new LogicalHostRouter(routerConf)
+  lazy val responder = new SpecificResponder(
+    classOf[AvroSourceProtocol], new FlumeEventServer(this))
+  lazy val hostName = Utils.localIpAddress // InetAddress.getLocalHost.getHostAddress
+  lazy val hostPort = selectFreePort
+  lazy val server = new NettyServer(responder, new InetSocketAddress(hostName, hostPort))
+
+  def onStart() {
+    server.start()
+    hostRouter.start()
+    hostRouter.registerPhysicalHost(logicalHost, getPhysicalHost)
+    logInfo("Flume receiver started")
+  }
+
+  private def getPhysicalHost = new PhysicalHost(hostName, hostPort)
+
+  private def selectFreePort : Int = {
+    val serverSocket : ServerSocket  = new ServerSocket(0)
+    val port = serverSocket.getLocalPort()
+    serverSocket.close()
+    logInfo("select a free port " + port)
+    port
+  }
+
+  def onStop() {
+    hostRouter.unregisterPhysicalHost(logicalHost, getPhysicalHost)
+    hostRouter.stop()
+    server.close()
+    logInfo("Flume receiver stopped")
+  }
+
+  override def preferredLocation = None
+}
+
+object DynamicFlumeReceiver {
+  val ROUTER_ROOT_PATH = "spark.router.path"
+  val ROUTER_LOGICAL_HOST = "spark.router.logicalhost"
+  val ROUTER_RETRY_INTERVAL_IN_MS = "spark.router.retry.interval"
+  val ROUTER_RETRY_TIMES = "spark.router.retry.times"
+}
+

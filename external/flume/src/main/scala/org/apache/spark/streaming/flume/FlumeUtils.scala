@@ -68,4 +68,23 @@ object FlumeUtils {
     ): JavaReceiverInputDStream[SparkFlumeEvent] = {
     createStream(jssc.ssc, hostname, port, storageLevel)
   }
+
+  /**
+   * Creates a input stream from a Flume source.
+   * @param numReceivers  receivers to started
+   * @param storageLevel  Storage level to use for storing the received objects
+   */
+  def createStream(
+      ssc: StreamingContext,
+      numReceivers : Int,
+      storageLevel: StorageLevel
+    ): DStream[SparkFlumeEvent] = {
+    var inputStream : DStream[SparkFlumeEvent] = new FlumeInputDStream[SparkFlumeEvent](ssc, "", 0,
+      storageLevel)
+    for (i <- 1 until numReceivers) {
+      inputStream = inputStream.union(new FlumeInputDStream[SparkFlumeEvent](ssc, "", 0,
+        storageLevel))
+    }
+    inputStream
+  }
 }
